@@ -8,7 +8,7 @@ lang: en
 timezone: Europe/Istanbul
 
 # jekyll-seo-tag settings
-title: 0s1mt
+title: Zer0smt
 
 tagline: open source vulnerability research & write-ups
 
@@ -42,7 +42,7 @@ theme_mode: dark
 
 cdn:
 
-avatar:
+avatar: /assets/img/avatar.jpeg
 
 social_preview_image:
 

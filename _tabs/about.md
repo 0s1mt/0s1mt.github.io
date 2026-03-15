@@ -5,9 +5,9 @@ order: 4
 
 ## Hey, I'm Abdulsamet
 
-I go by **0s1mt** online. I'm interested in open source security research — mostly digging through source code to find vulnerabilities and understanding how they work.
+This is where I share my findings. Security research and source code analysis are things I do on the side — out of curiosity, not obligation. I read through open source projects, look for vulnerabilities, and try to understand how they work.
 
-This blog is where I document my findings: write-ups on source code analysis, vulnerability breakdowns, and notes from ongoing research.
+This blog is where I document that process: write-ups, breakdowns, and notes from ongoing work.
 
 ---
 
@@ -22,4 +22,5 @@ This blog is where I document my findings: write-ups on source code analysis, vu
 
 ### Contact
 
-- GitHub: [0s1mt](https://github.com/0s1mt)
+- LinkedIn: [abdulsamet-sunar](https://www.linkedin.com/in/abdulsamet-sunar-/)
+- Mail: [abdulsametsunar45@gmail.com](mailto:abdulsametsunar45@gmail.com)

