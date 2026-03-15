@@ -44,7 +44,7 @@ cdn:
 
 avatar: /assets/img/avatar.jpeg
 
-social_preview_image:
+social_preview_image: /assets/img/preview.png
 
 toc: true
 
