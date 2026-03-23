@@ -264,7 +264,7 @@ This class of vulnerability follows a simple pattern: **user-controlled input re
 
 This vulnerability was reported through a responsible disclosure program and validated by the maintainers.
 
-![Bounty Proof](/assets/img/bounty2.png)
+![Bounty Proof](/assets/img/bounty4.png)
 
 ---
 

@@ -249,7 +249,7 @@ Bu zafiyet sınıfı basit bir kalıp izliyor: **kullanıcı kontrollü girdi `e
 
 Bu zafiyet sorumlu açıklama programı aracılığıyla raporlanmış ve geliştiriciler tarafından doğrulanmıştır.
 
-![Bounty Proof](/assets/img/bounty2.png)
+![Bounty Proof](/assets/img/bounty4.png)
 
 ---
 
